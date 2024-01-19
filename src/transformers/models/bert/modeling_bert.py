@@ -50,9 +50,15 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_bert import BertConfig
-
+import torch.nn.functional as F
+from . import custom_linear as cl
+from . import rand_layers as rl
 
 logger = logging.get_logger(__name__)
+
+# self def
+LOOP_LAYER_NUM = 7
+masker = rl.Masker(prune_ratio=0.8)
 
 _CHECKPOINT_FOR_DOC = "bert-base-uncased"
 _CONFIG_FOR_DOC = "BertConfig"
@@ -176,6 +182,46 @@ def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
         pointer.data = torch.from_numpy(array)
     return model
 
+class OurLinear(nn.Linear):
+    # linear_idx is the index of the linear layer
+    # step_idx is the index of iteration 
+    # act_type: relu or silu
+    # 我决定不为lienar_idx提供默认值，这样能避免出错。
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 device=None, dtype=None, linear_idx = None, act_type = None) -> None:
+        super().__init__(in_features, out_features, bias, device, dtype)
+        # print('Ourlinear step idx = 0')
+        self.step_idx = 0
+        self.linear_idx = linear_idx
+        self.act_type = act_type
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        layer_output = F.linear(input, self.weight, self.bias)
+        cl.cal_zero_ratio(layer_output, self.linear_idx, self.step_idx, self.act_type)
+        # print('Ourlinear step idx + 1')
+        self.step_idx += 1
+        return layer_output
+        
+    # 这个函数仅仅用作测试结构上是否已经完整，不需要在真实测试中使用。
+    # def named_modules(self, memo: Optional[Set['Module']] = None, prefix: str = '', remove_duplicate: bool = True):
+    #     # 在这里，我们将会重写 named_modules 的行为
+    #     # 例如，我们可以过滤掉特定的层或者改变返回的名称
+
+    #     modules = super().named_modules(memo, prefix)
+
+    #     for name, module in modules:
+    #         if module in self.__dict__.values():
+    #             # 如果是，添加自定义前缀或更改名称
+    #             name = 'our_linear_' + name if name else 'our_linear'
+    #         yield name, module
+
+# # self difination func: cal the zero ratio
+
+
+# def Our_F_Linear(input, weight, bias, linear_idx=None, step_idx=None, act_type=None):
+#     res = F.linear(input, weight, bias)
+#     # cal_zero_ratio(res, linear_idx, step_idx, act_type)
+#     return res
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
@@ -240,9 +286,10 @@ class BertEmbeddings(nn.Module):
         embeddings = self.dropout(embeddings)
         return embeddings
 
-
+# 将6替换为每层的乘法数量
+# 计算时忽略了部分matmul的乘法
 class BertSelfAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, layer_idx = None, position_embedding_type=None):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
@@ -253,11 +300,29 @@ class BertSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
-
+        mode = 'randAD'
+        # self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        # self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        # self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        if mode == 'randAD':
+            # print('mode = randAD')
+            self.query = cl.OurSparseLinear(config.hidden_size, self.all_head_size, linear_idx=layer_idx*LOOP_LAYER_NUM, act_type=config.hidden_act)
+            self.key = cl.OurSparseLinear(config.hidden_size, self.all_head_size, linear_idx=layer_idx*LOOP_LAYER_NUM+1, act_type=config.hidden_act)
+            self.value = cl.OurSparseLinear(config.hidden_size, self.all_head_size, linear_idx=layer_idx*LOOP_LAYER_NUM+2, act_type=config.hidden_act)
+            self.mm1 = cl.OurSparseMatMul(linear_idx=layer_idx*LOOP_LAYER_NUM+3, act_type=config.hidden_act)
+            self.mm2 = cl.OurSparseMatMul(linear_idx=layer_idx*LOOP_LAYER_NUM+4, act_type=config.hidden_act)
+        elif mode == 'backRazor':
+            self.query = cl.LinearSparse(config.hidden_size, self.all_head_size, masker=masker)
+            self.key = cl.LinearSparse(config.hidden_size, self.all_head_size, masker=masker)
+            self.value = cl.LinearSparse(config.hidden_size, self.all_head_size, masker=masker)
+            self.mm1 = torch.matmul
+            self.mm2 = torch.matmul
+        else:
+            self.query = cl.OurLinear(config.hidden_size, self.all_head_size, linear_idx=layer_idx*LOOP_LAYER_NUM, act_type=config.hidden_act)
+            self.key = cl.OurLinear(config.hidden_size, self.all_head_size, linear_idx=layer_idx*LOOP_LAYER_NUM+1, act_type=config.hidden_act)
+            self.value = cl.OurLinear(config.hidden_size, self.all_head_size, linear_idx=layer_idx*LOOP_LAYER_NUM+2, act_type=config.hidden_act)
+            self.mm1 = torch.matmul
+            self.mm2 = torch.matmul
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = position_embedding_type or getattr(
             config, "position_embedding_type", "absolute"
@@ -283,6 +348,7 @@ class BertSelfAttention(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
+        # input->ctx
         mixed_query_layer = self.query(hidden_states)
 
         # If this is instantiated as a cross-attention module, the keys
@@ -310,6 +376,7 @@ class BertSelfAttention(nn.Module):
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
+        # qkv calculated
         use_cache = past_key_value is not None
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -322,8 +389,16 @@ class BertSelfAttention(nn.Module):
             past_key_value = (key_layer, value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-
+        # q k -> a
+        # print('query_layer shape: ', query_layer.shape)
+        # print('key_layer shape: ', key_layer.shape)
+        
+        attention_scores = self.mm1(query_layer, key_layer.transpose(-1, -2)) # 
+        # 应该知道正确的ctx
+        # ctx replace
+        # 这里应该确定了f*Wk的时候，应该删哪些维。
+        # 为什么这里会知道？
+        # 因为k和q相乘得到了结果。而我们这里可以验证到
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             query_length, key_length = query_layer.shape[2], key_layer.shape[2]
             if use_cache:
@@ -353,6 +428,13 @@ class BertSelfAttention(nn.Module):
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        # relu
+        # a = k * q
+        # 假设已知k去掉456
+        # 此时ctx保存sparse的k和q
+        # sparse idx[123] 456
+        # 123->k q dense 456->0
+        # k [x] q [0] -> 0
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -362,7 +444,7 @@ class BertSelfAttention(nn.Module):
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
 
-        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = self.mm2(attention_probs, value_layer)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -376,11 +458,13 @@ class BertSelfAttention(nn.Module):
 
 
 class BertSelfOutput(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = cl.OurSparseLinear(config.hidden_size, config.hidden_size, linear_idx=layer_idx*LOOP_LAYER_NUM+3, act_type=config.hidden_act)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.layer_idx = layer_idx
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -390,11 +474,12 @@ class BertSelfOutput(nn.Module):
 
 
 class BertAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, layer_idx = None,  position_embedding_type=None):
         super().__init__()
-        self.self = BertSelfAttention(config, position_embedding_type=position_embedding_type)
-        self.output = BertSelfOutput(config)
+        self.self = BertSelfAttention(config, layer_idx=layer_idx, position_embedding_type=position_embedding_type)
+        self.output = BertSelfOutput(config, layer_idx)
         self.pruned_heads = set()
+        self.layer_idx = layer_idx
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -439,26 +524,39 @@ class BertAttention(nn.Module):
 
 
 class BertIntermediate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,layer_idx):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        # self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.dense = cl.OurSparseLinear(config.hidden_size, config.intermediate_size,linear_idx=layer_idx*LOOP_LAYER_NUM+4, act_type=config.hidden_act)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
+        self.layer_idx = layer_idx
+        self.act_type = config.hidden_act 
+        # print('BertIntermediate step idx = 0')
+        self.step_idx = 0
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # print('start forward',self.step_idx)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
+        cl.cal_zero_ratio(hidden_states, self.layer_idx*LOOP_LAYER_NUM+5, self.step_idx, self.act_type)
+        # cal_zero_ratio(hidden_states, self.layer_idx, self.step_idx, self.act_type)
+        # print('BertIntermediate step idx + 1')
+        self.step_idx = self.step_idx+1
+        # print('end forward',self.step_idx)
         return hidden_states
 
 
 class BertOutput(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,layer_idx):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        # self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.dense = cl.OurSparseLinear(config.intermediate_size, config.hidden_size, linear_idx=layer_idx*LOOP_LAYER_NUM+6, act_type=config.hidden_act)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.layer_idx = layer_idx
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -468,19 +566,21 @@ class BertOutput(nn.Module):
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = BertAttention(config)
+        self.attention = BertAttention(config, layer_idx=layer_idx)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
         if self.add_cross_attention:
+            print('add_cross_attention')
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
-            self.crossattention = BertAttention(config, position_embedding_type="absolute")
-        self.intermediate = BertIntermediate(config)
-        self.output = BertOutput(config)
+            self.crossattention = BertAttention(config, layer_idx=layer_idx, position_embedding_type="absolute")
+        self.intermediate = BertIntermediate(config,layer_idx)
+        self.output = BertOutput(config,layer_idx)
+        self.layer_idx = layer_idx
 
     def forward(
         self,
@@ -557,7 +657,7 @@ class BertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([BertLayer(config,layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -649,7 +749,8 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = cl.OurSparseLinear(config.hidden_size, config.hidden_size, linear_idx=12*LOOP_LAYER_NUM, act_type=config.hidden_act)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1527,7 +1628,8 @@ class BertForSequenceClassification(BertPreTrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        # self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.classifier = OurLinear(config.hidden_size, config.num_labels, linear_idx=12*LOOP_LAYER_NUM+1, act_type=config.hidden_act)
 
         # Initialize weights and apply final processing
         self.post_init()
