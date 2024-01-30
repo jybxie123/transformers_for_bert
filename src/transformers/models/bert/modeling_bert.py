@@ -234,7 +234,7 @@ class BertEmbeddings(nn.Module):
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.LayerNorm = cl.OurSparseNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
@@ -304,7 +304,8 @@ class BertSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-        mode = 'normal'
+        mode = 'randAD' 
+        # randAD, normal, backRazor
         self.mode = mode
         # self.query = nn.Linear(config.hidden_size, self.all_head_size)
         # self.key = nn.Linear(config.hidden_size, self.all_head_size)
@@ -317,7 +318,7 @@ class BertSelfAttention(nn.Module):
             self.mm1 = cl.OurSparseMatMul(linear_idx=layer_idx*LOOP_LAYER_NUM+3, act_type=config.hidden_act)
             self.mm2 = cl.OurSparseMatMul(linear_idx=layer_idx*LOOP_LAYER_NUM+4, act_type=config.hidden_act)
             # tobesparse: our sparse softmax
-            # self.softmax_mm2 = SoftmaxMatMulSparse(dim=-1, quantize=config.quantize, half=config.half, masker=masker)
+            self.softmax_mm2 = cl.OurSparseSoftmaxMatMul(dim=-1, quantize=config.quantize, half=config.half, masker=masker)
         elif mode == 'backRazor':
             self.query = cl.LinearSparse(config.hidden_size, self.all_head_size, masker=masker)
             self.key = cl.LinearSparse(config.hidden_size, self.all_head_size, masker=masker)
@@ -434,7 +435,11 @@ class BertSelfAttention(nn.Module):
             attention_scores = attention_scores + attention_mask
 
         # Normalize the attention scores to probabilities.
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        if self.mode == 'randAD':
+            context_layer = self.softmax_mm2(attention_scores)
+        else: # normal
+            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+            context_layer = self.mm2(attention_probs, value_layer)
         # relu
         # a = k * q
         # 假设已知k去掉456
@@ -453,7 +458,6 @@ class BertSelfAttention(nn.Module):
         #     attention_probs = attention_probs * head_mask
         # =====above not used in backrazor=====
 
-        context_layer = self.mm2(attention_probs, value_layer)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -470,13 +474,13 @@ class BertSelfOutput(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.dense = cl.OurSparseLinear(config.hidden_size, config.hidden_size, linear_idx=layer_idx*LOOP_LAYER_NUM+3, act_type=config.hidden_act)
         else:
             self.dense = OurLinear(config.hidden_size, config.hidden_size, linear_idx=layer_idx*LOOP_LAYER_NUM+3, act_type=config.hidden_act)
         # tobesparse: our sparse norm
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.LayerNorm = cl.OurSparseNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
@@ -545,7 +549,7 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config,layer_idx):
         super().__init__()
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.dense = cl.OurSparseLinear(config.hidden_size, config.intermediate_size,linear_idx=layer_idx*LOOP_LAYER_NUM+4, act_type=config.hidden_act)
         else:
@@ -574,14 +578,14 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config,layer_idx):
         super().__init__()
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.dense = cl.OurSparseLinear(config.intermediate_size, config.hidden_size, linear_idx=layer_idx*LOOP_LAYER_NUM+6, act_type=config.hidden_act)
         else:
             self.dense = OurLinear(config.intermediate_size, config.hidden_size, linear_idx=layer_idx*LOOP_LAYER_NUM+6, act_type=config.hidden_act)
         # self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         # tobesparse: our sparse norm
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.LayerNorm = cl.OurSparseNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
@@ -780,7 +784,7 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.dense = cl.OurSparseLinear(config.hidden_size, config.hidden_size, linear_idx=12*LOOP_LAYER_NUM, act_type=config.hidden_act)
         else:
@@ -805,7 +809,7 @@ class BertPredictionHeadTransform(nn.Module):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.LayerNorm = cl.OurSparseNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
@@ -1667,7 +1671,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
-        mode = 'normal'
+        mode = 'randAD'
         if mode == 'randAD':
             self.classifier = cl.OurSparseLinear(config.hidden_size, config.num_labels, linear_idx=12*LOOP_LAYER_NUM+1, act_type=config.hidden_act)
         else:

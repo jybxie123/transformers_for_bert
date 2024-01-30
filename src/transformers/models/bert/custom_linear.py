@@ -4,7 +4,7 @@ import logging
 
 # from mesa import custom_quant
 # from mesa import native
-sys.path.insert(0, '/home/bizon/yanbo_random/bert_finetune_sparsify_new_version/transformers/src/transformers/models/bert')
+sys.path.insert(0, '/disk3/Haonan/yanbo_random/bert_finetune_sparsify/transformers/src/transformers/models/bert')
 from rand_layers import sparsify, unsparsify
 from pdb import set_trace
 import torch
@@ -12,9 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ================== our method ==================
-class OurSparseLinear(torch.nn.Linear):
+class OurLinear(torch.nn.Linear):
     def __init__(self, *args, keep_frac=0.5, linear_idx = None, act_type = None, **kwargs):
-        super(OurSparseLinear, self).__init__(*args, **kwargs)
+        super(OurLinear, self).__init__(*args, **kwargs)
         self.keep_frac = keep_frac
         self.step_idx = 0
         self.linear_idx = linear_idx
@@ -69,9 +69,9 @@ class sparseMatMul(torch.autograd.Function):
         return input_grad, weight_grad, bias_grad, None, None, None, None
 
 
-class OurSparseMatMul(nn.Module):
+class OurMatMul(torch.matmul):
     def __init__(self, args=None, keep_frac=0.5, linear_idx = None, act_type = None ):
-        super(OurSparseMatMul, self).__init__()
+        super(OurMatMul, self).__init__()
         self.keep_frac = keep_frac
         self.step_idx = 0
         self.linear_idx = linear_idx
@@ -110,9 +110,9 @@ class doubleSparseMatMul(torch.autograd.Function):
         return grad_input1, grad_input2, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
-class OurSparseNorm(nn.LayerNorm):
+class OurLayerNorm(nn.LayerNorm):
     def __init__(self, normalized_shape, eps=1e-05, elementwise_affine=True, keep_frac=0.5):
-        super(OurSparseNorm, self).__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+        super(OurLayerNorm, self).__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
         self.tag = 'layernorm'
         self.keep_frac = keep_frac
 
@@ -189,9 +189,9 @@ def layernorm_backward(dout, normalized_shape, cache):
     dx = dlxhat*dxhatx + dlvar*dlvarx + dlmu/D
     return dx, dgamma, dbeta
 
-class SparseSoftmaxMatMul(nn.Module):
+class OurSoftmaxMatMul(nn.Module):
     def __init__(self, dim=-1):
-        super(SparseSoftmaxMatMul, self).__init__()
+        super(OurSoftmaxMatMul, self).__init__()
         self.dim = dim
 
     def forward(self, x1, x2):
@@ -207,14 +207,14 @@ class softmax_matmul(torch.autograd.Function):
         gather_index = rl.get_batch_score(input1_sm, input2, 1.0)
         sparse_x_1 = rl.get_sparse_input(input1_sm, gather_index)
         sparse_x_2 = rl.get_sparse_input(input2, gather_index)
-        ctx.save_for_backward(gather_index, sparse_x_1.to_sparse(), sparse_x_2.to_sparse())
+        ctx.save_for_backward(sparse_x_1.to_sparse(), sparse_x_2.to_sparse())
         output = input1_sm.matmul(input2)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_input1 = grad_input2 = None
-        gather_index, sparse_x_1, sparse_x_2 = ctx.saved_tensors
+        grad_input_1 = grad_input_2 = None
+        sparse_x_1, sparse_x_2 = ctx.saved_tensors
         
         sparse_x_1 = sparse_x_1.float().requires_grad_(True)
         sparse_x_2 = sparse_x_2.float().requires_grad_(True)
